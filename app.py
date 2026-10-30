@@ -40,10 +40,30 @@ def saved_upload(upload, stem):
 
 
 def load_saved_chargers():
-    path = DATA_DIR / "chargers_api.csv"
-    if not path.exists():
-        return None
-    return pd.read_csv(path, dtype=str, low_memory=False)
+    csv_path = DATA_DIR / "chargers_api.csv"
+    zip_path = DATA_DIR / "chargers_api.zip"
+
+    # 기존 CSV 파일이 있으면 먼저 사용
+    if csv_path.exists():
+        return pd.read_csv(csv_path, dtype=str, low_memory=False)
+
+    # CSV 파일이 없으면 ZIP 파일에서 불러오기
+    if zip_path.exists():
+        import zipfile
+
+        with zipfile.ZipFile(zip_path, "r") as z:
+            csv_files = [
+                name for name in z.namelist()
+                if name.lower().endswith(".csv")
+            ]
+
+            if not csv_files:
+                raise ValueError("ZIP 파일 안에 CSV 파일이 없습니다.")
+
+            with z.open(csv_files[0]) as f:
+                return pd.read_csv(f, dtype=str, low_memory=False)
+
+    return None
 
 
 PROVINCES = [
