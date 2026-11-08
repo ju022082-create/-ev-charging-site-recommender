@@ -13,7 +13,7 @@ from streamlit_folium import st_folium
 st.set_page_config(page_title="EV 급속충전소 입지 분석", page_icon="⚡", layout="wide")
 st.title("⚡ EV 급속충전소 최적 입지 분석")
 st.caption(
-    "실제 공공데이터 기반 · 전국 탐색 → 선택 지역 상세 분석 · 연구용 의사결정 지원 도구"
+    "공공데이터 및 가상 전력망 시뮬레이션 · 전국 탐색 → 선택 지역 상세 분석 · 연구용 도구"
 )
 
 # Persistent local cache. This folder contains data only, never API credentials.
@@ -240,12 +240,12 @@ def score_table(chargers, ev, traffic, weights, grid=None):
     valid["전력망점수"] = np.nan
     valid["전력망평가"] = "정보 미확인"
     if grid is not None:
-        # A grid score is allowed only if supplied explicitly as a verified 0-100 suitability score.
+        # Grid scores may be synthetic for demonstration; never interpret as verified capacity.
         valid = valid.merge(grid, on="지역", how="left", suffixes=("", "_입력"))
         if "전력망점수_입력" in valid:
             valid["전력망점수"] = valid.pop("전력망점수_입력")
         has_grid = valid["전력망점수"].notna()
-        valid.loc[has_grid, "전력망평가"] = "입력 점수 반영 (접속 가능 보증 아님)"
+        valid.loc[has_grid, "전력망평가"] = "입력 점수 반영 (실제 접속 가능 여부 아님)"
         grid_weight = weights.get("전력망점수", 0)
         if base_total and grid_weight:
             valid.loc[has_grid, "최종점수"] = (
@@ -338,15 +338,24 @@ with st.sidebar:
         st.caption("교통량 데이터: PC에 저장됨")
     st.header("③ 전력망 적합성 데이터 (선택)")
     st.caption(
-        "지역, 전력망점수 열이 있는 CSV/XLSX만 사용합니다. 점수는 검증된 0~100 적합성 평가값이어야 합니다. 송전망 여유용량 원자료를 그대로 넣지 마세요."
+        "지역, 전력망점수 열이 있는 CSV/XLSX를 사용합니다. 기본값은 시연용 가상 점수이며 실제 전력망 공급 여유용량이 아닙니다."
     )
-    gridfile = st.file_uploader(
-        "전력망 적합성 점수 파일", type=["csv", "xlsx"], key="grid"
+    grid_upload = st.file_uploader(
+        "전력망 적합성 점수 파일 (선택: 업로드 시 기본 데이터 대신 사용)",
+        type=["csv", "xlsx"], key="grid"
     )
-    try:
-        gridfile = saved_upload(gridfile, "grid_suitability")
-    except Exception as e:
-        st.error(f"전력망 파일 저장 오류: {e}")
+    # A user upload overrides the bundled demo file only for this session.
+    # Never overwrite the GitHub-tracked synthetic CSV on Streamlit Cloud.
+    demo_grid_path = DATA_DIR / "가상_전력망적합성_시연용.csv"
+    if grid_upload is not None:
+        gridfile = grid_upload
+        st.info("사용자가 업로드한 전력망 점수 파일을 적용합니다. 출처와 검증 여부를 확인하세요.")
+    elif demo_grid_path.exists():
+        gridfile = SimpleNamespace(name=demo_grid_path.name, getvalue=demo_grid_path.read_bytes)
+        st.warning("가상 전력망 적합성 점수 적용 중 — 실제 전력망 공급 여유용량이나 설치 가능성을 의미하지 않습니다.")
+    else:
+        gridfile = None
+        st.info("기본 가상 전력망 CSV가 없습니다. saved_data/가상_전력망적합성_시연용.csv 파일을 GitHub에 추가하거나 직접 업로드하세요.")
     st.header("④ 평가 가중치")
     w1 = st.slider("교통량", 0, 100, 35)
     w2 = st.slider("전기차 수요", 0, 100, 35)
@@ -522,5 +531,5 @@ else:
     )
 st.divider()
 st.caption(
-    "주의: 전력망점수는 별도로 검증된 적합성 점수 입력이 필요하며, 송전망 여유용량을 그대로 변환한 값은 사용할 수 없습니다. 전력망 점수 미확인 지역은 기존 3개 요소로만 계산됩니다. 행정구역 단위 1차 스크리닝 결과입니다. 교통량은 전기차 통행량과 다르며, 급속충전기 수는 실제 가용 용량·이용률을 대변하지 않습니다. 지도 표식은 해당 행정구역의 기존 충전기 좌표 평균이며 실제 설치 부지가 아닙니다. 전력계통 여유, 부지 소유권, 진출입 안전성 등은 2차 현장 검토가 필요합니다."
+    "주의: 기본 전력망점수는 시연용으로 임의 생성한 가상 데이터이며 실제 전력 공급 여유용량 또는 설치 가능성을 뜻하지 않습니다. 별도 검증된 점수를 업로드하지 않는 한 결과는 시뮬레이션입니다. 전력망 점수 미확인 지역은 기존 3개 요소로만 계산됩니다. 행정구역 단위 1차 스크리닝 결과입니다. 교통량은 전기차 통행량과 다르며, 급속충전기 수는 실제 가용 용량·이용률을 대변하지 않습니다. 지도 표식은 해당 행정구역의 기존 충전기 좌표 평균이며 실제 설치 부지가 아닙니다. 전력계통 여유, 부지 소유권, 진출입 안전성 등은 2차 현장 검토가 필요합니다."
 )
