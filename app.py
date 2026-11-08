@@ -52,10 +52,7 @@ def load_saved_chargers():
         import zipfile
 
         with zipfile.ZipFile(zip_path, "r") as z:
-            csv_files = [
-                name for name in z.namelist()
-                if name.lower().endswith(".csv")
-            ]
+            csv_files = [name for name in z.namelist() if name.lower().endswith(".csv")]
 
             if not csv_files:
                 raise ValueError("ZIP 파일 안에 CSV 파일이 없습니다.")
@@ -187,7 +184,7 @@ def normalize_chargers(df):
     return d
 
 
-def score_table(chargers, ev, traffic, weights):
+def score_table(chargers, ev, traffic, weights, grid=None):
     # Aggregate by administrative name; charging supply is per charger, not station.
     supply = chargers.groupby(["시도", "시군구"], as_index=False).agg(
         급속충전기수=("주소", "size"), 위도=("위도", "mean"), 경도=("경도", "mean")
@@ -231,8 +228,37 @@ def score_table(chargers, ev, traffic, weights):
         ("충전인프라부족지표", "인프라부족점수"),
     ]:
         valid[dest] = scale(valid[source])
-    valid["최종점수"] = sum(valid[c] * weights[c] for c in weights)
-    return data, valid.sort_values("최종점수", ascending=False)
+    # Preserve the original three-factor model as a comparable baseline.
+    base_weights = {k: v for k, v in weights.items() if k != "전력망점수"}
+    base_total = sum(base_weights.values())
+    valid["기존점수"] = (
+        sum(valid[k] * v / base_total for k, v in base_weights.items())
+        if base_total
+        else np.nan
+    )
+    valid["최종점수"] = valid["기존점수"]
+    valid["전력망점수"] = np.nan
+    valid["전력망평가"] = "정보 미확인"
+    if grid is not None:
+        # A grid score is allowed only if supplied explicitly as a verified 0-100 suitability score.
+        valid = valid.merge(grid, on="지역", how="left", suffixes=("", "_입력"))
+        if "전력망점수_입력" in valid:
+            valid["전력망점수"] = valid.pop("전력망점수_입력")
+        has_grid = valid["전력망점수"].notna()
+        valid.loc[has_grid, "전력망평가"] = "입력 점수 반영 (접속 가능 보증 아님)"
+        grid_weight = weights.get("전력망점수", 0)
+        if base_total and grid_weight:
+            valid.loc[has_grid, "최종점수"] = (
+                valid.loc[has_grid, "기존점수"] * base_total
+                + valid.loc[has_grid, "전력망점수"] * grid_weight
+            ) / (base_total + grid_weight)
+    valid["전력망반영여부"] = valid["전력망점수"].notna() & (
+        weights.get("전력망점수", 0) > 0
+    )
+    # Do not rank unassessed regions against grid-assessed regions as though comparable.
+    return data, valid.sort_values(
+        ["전력망반영여부", "최종점수"], ascending=[False, False]
+    )
 
 
 st.info(
@@ -259,11 +285,19 @@ with st.sidebar:
                 try:
                     fetched = fetch_api(key, int(max_pages))
                     if fetched.empty:
-                        st.warning("API에서 데이터가 반환되지 않았습니다. 기존 저장 데이터는 유지합니다.")
+                        st.warning(
+                            "API에서 데이터가 반환되지 않았습니다. 기존 저장 데이터는 유지합니다."
+                        )
                     else:
-                        fetched.to_csv(DATA_DIR / "chargers_api.csv", index=False, encoding="utf-8-sig")
+                        fetched.to_csv(
+                            DATA_DIR / "chargers_api.csv",
+                            index=False,
+                            encoding="utf-8-sig",
+                        )
                         st.session_state["raw"] = fetched
-                        st.success(f"충전기 데이터 {len(fetched):,}행을 PC에 저장했습니다.")
+                        st.success(
+                            f"충전기 데이터 {len(fetched):,}행을 PC에 저장했습니다."
+                        )
                 except Exception as e:
                     st.error(f"API 요청 실패: {e}")
         raw = st.session_state.get("raw")
@@ -302,14 +336,26 @@ with st.sidebar:
         st.caption("전기차 등록 데이터: PC에 저장됨")
     if trfile is not None:
         st.caption("교통량 데이터: PC에 저장됨")
-    st.header("③ 평가 가중치")
+    st.header("③ 전력망 적합성 데이터 (선택)")
+    st.caption(
+        "지역, 전력망점수 열이 있는 CSV/XLSX만 사용합니다. 점수는 검증된 0~100 적합성 평가값이어야 합니다. 송전망 여유용량 원자료를 그대로 넣지 마세요."
+    )
+    gridfile = st.file_uploader(
+        "전력망 적합성 점수 파일", type=["csv", "xlsx"], key="grid"
+    )
+    try:
+        gridfile = saved_upload(gridfile, "grid_suitability")
+    except Exception as e:
+        st.error(f"전력망 파일 저장 오류: {e}")
+    st.header("④ 평가 가중치")
     w1 = st.slider("교통량", 0, 100, 35)
     w2 = st.slider("전기차 수요", 0, 100, 35)
     w3 = st.slider("인프라 부족", 0, 100, 30)
+    w4 = st.slider("전력망 적합성", 0, 100, 25)
     if w1 + w2 + w3 == 0:
         st.error("가중치 중 하나 이상을 양수로 설정하세요.")
     st.caption(
-        "가중치는 합계와 관계없이 자동 정규화됩니다. 현재 모델은 3개 데이터 지표만 평가합니다."
+        "가중치는 자동 정규화됩니다. 전력망 점수가 없는 지역은 기존 3개 지표로만 계산하며, 전력망 평가 지역과 순위를 구분합니다."
     )
 
 st.markdown("### 분석 범위")
@@ -342,6 +388,9 @@ def read_aux(file, value_col):
         raise ValueError(f"필수 열: 지역, {value_col}")
     frame = frame[["지역", value_col]].copy()
     frame["지역"] = frame["지역"].astype(str).str.strip()
+    frame["지역"] = frame["지역"].replace(
+        {r"^" + short + r"(?=\s)": full for short, full in ALIASES.items()}, regex=True
+    )
     frame[value_col] = pd.to_numeric(frame[value_col], errors="coerce")
     if frame["지역"].duplicated().any():
         raise ValueError(
@@ -353,7 +402,14 @@ def read_aux(file, value_col):
 try:
     ev = read_aux(evfile, "전기차등록대수")
     traffic = read_aux(trfile, "일평균교통량")
-    denom = max(w1 + w2 + w3, 1)
+    grid = read_aux(gridfile, "전력망점수")
+    if grid is not None:
+        if (
+            grid["전력망점수"].isna().any()
+            or not grid["전력망점수"].between(0, 100).all()
+        ):
+            raise ValueError("전력망점수는 결측 없이 0~100 사이여야 합니다.")
+    denom = max(w1 + w2 + w3 + w4, 1)
     overview, ranked = score_table(
         chargers,
         ev,
@@ -362,7 +418,9 @@ try:
             "교통량점수": w1 / denom,
             "전기차수요점수": w2 / denom,
             "인프라부족점수": w3 / denom,
+            "전력망점수": w4 / denom,
         },
+        grid=grid,
     )
 except Exception as e:
     st.error(f"분석 데이터 오류: {e}")
@@ -428,11 +486,24 @@ elif ranked.empty:
     )
 else:
     st.subheader("📍 신규 급속충전소 입지 우선 검토 지역")
+    if grid is None:
+        st.info(
+            "전력망 점수 데이터가 없어 기존 3개 지표로만 추천합니다. 전력망 25% 가중치는 아직 적용되지 않았습니다."
+        )
+    elif not ranked["전력망반영여부"].any():
+        st.warning("전력망 점수가 연결된 지역이 없습니다. 지역 이름을 확인하세요.")
+    else:
+        st.info(
+            "전력망 점수가 연결된 지역을 먼저 표시합니다. 미확인 지역은 기존 점수만 있으므로 직접적인 순위 비교에 주의하세요."
+        )
     st.dataframe(
         ranked[
             [
                 "지역",
                 "최종점수",
+                "기존점수",
+                "전력망점수",
+                "전력망평가",
                 "일평균교통량",
                 "전기차등록대수",
                 "급속충전기수",
@@ -451,5 +522,5 @@ else:
     )
 st.divider()
 st.caption(
-    "주의: 행정구역 단위 1차 스크리닝 결과입니다. 교통량은 전기차 통행량과 다르며, 급속충전기 수는 실제 가용 용량·이용률을 대변하지 않습니다. 지도 표식은 해당 행정구역의 기존 충전기 좌표 평균이며 실제 설치 부지가 아닙니다. 전력계통 여유, 부지 소유권, 진출입 안전성 등은 2차 현장 검토가 필요합니다."
+    "주의: 전력망점수는 별도로 검증된 적합성 점수 입력이 필요하며, 송전망 여유용량을 그대로 변환한 값은 사용할 수 없습니다. 전력망 점수 미확인 지역은 기존 3개 요소로만 계산됩니다. 행정구역 단위 1차 스크리닝 결과입니다. 교통량은 전기차 통행량과 다르며, 급속충전기 수는 실제 가용 용량·이용률을 대변하지 않습니다. 지도 표식은 해당 행정구역의 기존 충전기 좌표 평균이며 실제 설치 부지가 아닙니다. 전력계통 여유, 부지 소유권, 진출입 안전성 등은 2차 현장 검토가 필요합니다."
 )
